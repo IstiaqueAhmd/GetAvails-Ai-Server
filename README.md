@@ -1,0 +1,2 @@
+# GetAvails Ai Server
+
