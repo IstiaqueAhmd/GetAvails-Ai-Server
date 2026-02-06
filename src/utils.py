@@ -33,13 +33,20 @@ def save_message(db: Session, session_id: str, role: str, content: str):
     db.add(db_message)
     db.commit()
 
-def get_chat_history(db: Session, session_id: str) -> List[Dict[str, str]]:
-    """Get chat history for a session"""
+def get_chat_history(db: Session, session_id: str, page: int = 1, page_size: int = 20) -> tuple[List[Dict[str, str]], int]:
+    """Get paginated chat history for a session"""
+    # Get total count
+    total = db.query(ChatMessage).filter(
+        ChatMessage.session_id == session_id
+    ).count()
+    
+    # Get paginated messages
+    offset = (page - 1) * page_size
     messages = db.query(ChatMessage).filter(
         ChatMessage.session_id == session_id
-    ).order_by(ChatMessage.timestamp).all()
+    ).order_by(ChatMessage.timestamp).offset(offset).limit(page_size).all()
     
-    return [{"role": msg.role, "content": msg.content} for msg in messages]
+    return [{"role": msg.role, "content": msg.content, "timestamp": msg.timestamp} for msg in messages], total
 
 def get_user_sessions(db: Session, user_id: str) -> List[ChatSession]:
     """Get all chat sessions for a user"""

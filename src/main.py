@@ -259,8 +259,8 @@ async def chat_endpoint(
         session_id = request.session_id
         user_id = str(current_user.id)
 
-        # Get conversation history
-        history = get_chat_history(db, session_id)
+        # Get conversation history (all messages for AI context)
+        history, _ = get_chat_history(db, session_id, page=1, page_size=1000)
     
         # Generate title if this is the first message
         if len(history) == 0:
@@ -348,17 +348,38 @@ async def get_sessions(
 @app.get("/chat/history", response_model=ChatHistory)
 async def get_session_history(
     session_id: str,
+    page: int = 1,
+    page_size: int = 20,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Get chat history for a specific session (requires authentication and ownership)"""
+    """
+    Get paginated chat history for a specific session.
+    
+    - **session_id**: The session ID to get history for
+    - **page**: Page number (default: 1)
+    - **page_size**: Number of messages per page (default: 20, max: 100)
+    """
     try:
-        messages = get_chat_history(db, session_id)
+        # Validate page_size
+        page_size = min(page_size, 100)  # Cap at 100
+        page = max(page, 1)  # Ensure page >= 1
+        
+        messages, total = get_chat_history(db, session_id, page, page_size)
+        total_pages = (total + page_size - 1) // page_size  # Ceiling division
+        
         chat_messages = [
-            {"role": msg["role"], "content": msg["content"], "timestamp": datetime.utcnow()}
+            {"role": msg["role"], "content": msg["content"], "timestamp": msg.get("timestamp", datetime.utcnow())}
             for msg in messages
         ]
-        return ChatHistory(session_id=session_id, messages=chat_messages)
+        return ChatHistory(
+            session_id=session_id,
+            messages=chat_messages,
+            page=page,
+            page_size=page_size,
+            total_messages=total,
+            total_pages=total_pages
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

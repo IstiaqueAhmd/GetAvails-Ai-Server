@@ -71,6 +71,10 @@ class ChatSession(BaseModel):
 class ChatHistory(BaseModel):
     session_id: str
     messages: List[ChatMessage]
+    page: int
+    page_size: int
+    total_messages: int
+    total_pages: int
 
 class SessionList(BaseModel):
     sessions: List[ChatSession]
