@@ -6,10 +6,14 @@ The graph connects the agent node and tool node with conditional routing.
 """
 
 from langgraph.graph import StateGraph, END
+import logging
 
 from src.states import AgentState
 from src.nodes import create_agent_node, create_tool_node
 from src.edges import should_continue
+
+# Configure logger for graphs
+logger = logging.getLogger("tour_guide.graphs")
 
 
 def create_agent_graph(model: str, system_prompt: str, max_tokens: int, api_key: str):
@@ -25,6 +29,8 @@ def create_agent_graph(model: str, system_prompt: str, max_tokens: int, api_key:
     Returns:
         A compiled LangGraph workflow ready for invocation
     """
+    logger.info(f"Creating agent graph with model={model}, max_tokens={max_tokens}")
+    
     # Create nodes
     agent_node = create_agent_node(model, system_prompt, max_tokens, api_key)
     tool_node = create_tool_node()
@@ -53,4 +59,5 @@ def create_agent_graph(model: str, system_prompt: str, max_tokens: int, api_key:
     workflow.add_edge("tools", "agent")
     
     # Compile and return the graph
+    logger.info("Agent graph compiled successfully")
     return workflow.compile()

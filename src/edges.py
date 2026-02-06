@@ -7,8 +7,12 @@ Edges determine how the graph flows between nodes.
 
 from typing import Literal
 from langchain_core.messages import AIMessage
+import logging
 
 from src.states import AgentState
+
+# Configure logger for edges
+logger = logging.getLogger("tour_guide.edges")
 
 
 def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
@@ -29,7 +33,9 @@ def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
     
     # Check if the last message is an AI message with tool calls
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
+        logger.info(f"Routing to tools: {[tc['name'] for tc in last_message.tool_calls]}")
         return "tools"
     
     # No tool calls, end the conversation turn
+    logger.info("Routing to end (no tool calls)")
     return "__end__"

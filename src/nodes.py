@@ -8,9 +8,14 @@ Each node is a function that takes the current state and returns an update.
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import ToolNode
+import logging
+from datetime import datetime
 
 from src.states import AgentState
 from src.tools import TOOLS
+
+# Configure logger for nodes
+logger = logging.getLogger("tour_guide.nodes")
 
 
 def create_agent_node(model: str, system_prompt: str, max_tokens: int, api_key: str):
@@ -45,13 +50,32 @@ def create_agent_node(model: str, system_prompt: str, max_tokens: int, api_key: 
             A dict with the updated messages
         """
         messages = state["messages"]
+        logger.info(f"Agent node processing {len(messages)} messages")
+        
+        # Get current date and time
+        now = datetime.now()
+        current_datetime = now.strftime("%A, %B %d, %Y at %I:%M %p")
+        
+        # Create system message with current date/time injected
+        full_system_prompt = f"{system_prompt}\n\nCurrent date and time: {current_datetime}"
         
         # Add system message at the beginning if not present
         if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [SystemMessage(content=system_prompt)] + list(messages)
+            messages = [SystemMessage(content=full_system_prompt)] + list(messages)
+        else:
+            # Update the existing system message with current time
+            messages = [SystemMessage(content=full_system_prompt)] + list(messages[1:])
         
         # Invoke the LLM
+        logger.debug("Invoking LLM for response")
         response = llm.invoke(messages)
+        
+        # Log if tool calls are present
+        if hasattr(response, 'tool_calls') and response.tool_calls:
+            tool_names = [tc['name'] for tc in response.tool_calls]
+            logger.info(f"Agent decided to use tools: {tool_names}")
+        else:
+            logger.info("Agent generated final response (no tools)")
         
         return {"messages": [response]}
     
@@ -65,4 +89,5 @@ def create_tool_node():
     Returns:
         A ToolNode configured with the available tools
     """
+    logger.info(f"Tool node created with {len(TOOLS)} tools: {[t.name for t in TOOLS]}")
     return ToolNode(TOOLS)
