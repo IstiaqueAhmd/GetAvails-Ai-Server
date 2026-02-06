@@ -36,3 +36,6 @@ starlette==0.41.3
 tqdm==4.67.3
 typing-extensions==4.15.0
 uvicorn==0.32.1
+langchain>=0.3.0
+langchain-openai>=0.3.0
+langgraph>=0.2.0
