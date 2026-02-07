@@ -4,9 +4,7 @@ import os
 import logging
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, AIMessage
-from sqlalchemy.exc import IntegrityError
 
-from src.database import SessionLocal, ChatSettings
 from src.graphs import create_agent_graph
 
 load_dotenv()
@@ -18,23 +16,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tour_guide.chat")
 
-def get_or_create_chat_settings():
-    """Get chat settings from database, create default if not exists.
-    
-    This function is safe for concurrent access from multiple workers.
-    If multiple workers try to create the settings simultaneously,
-    we catch the IntegrityError and fetch the existing record.
-    """
-    db = SessionLocal()
-    try:
-        settings = db.query(ChatSettings).filter(ChatSettings.id == 1).first()
-        if not settings:
-            try:
-                settings = ChatSettings(
-                    id=1,
-                    openai_api_key=None,  # Will fall back to env var
-                    model="gpt-4o-mini",
-                    system_prompt="""You are a helpful and friendly AI tour guide assistant called GetAvails. You help users plan trips, find flights, discover destinations, and provide travel advice.
+# Default system prompt for the tour guide agent
+DEFAULT_SYSTEM_PROMPT = """You are a helpful and friendly AI tour guide assistant called GetAvails. You help users plan trips, find flights, discover destinations, and provide travel advice.
 
 IMPORTANT GUIDELINES:
 1. For general conversation, greetings, or unclear messages - respond directly WITHOUT using any tools. Just be friendly and ask how you can help.
@@ -42,28 +25,19 @@ IMPORTANT GUIDELINES:
 3. Only use get_airport_info when the user specifically asks about airport codes or airports for a city.
 4. Only use get_destination_info when the user asks about travel information for a specific destination.
 
-If the user's message is vague or unclear, ask clarifying questions instead of using tools. Be conversational and helpful!""",
-                    max_tokens=1000,
-                    response_format="Short and concise"
-                )
-                db.add(settings)
-                db.commit()
-                db.refresh(settings)
-            except IntegrityError:
-                # Another worker created the settings first - rollback and fetch it
-                db.rollback()
-                settings = db.query(ChatSettings).filter(ChatSettings.id == 1).first()
-                if not settings:
-                    raise RuntimeError("Failed to get or create chat settings")
-        return {
-            "openai_api_key": settings.openai_api_key,
-            "model": settings.model,
-            "system_prompt": settings.system_prompt,
-            "max_tokens": settings.max_tokens,
-            "response_format": settings.response_format
-        }
-    finally:
-        db.close()
+If the user's message is vague or unclear, ask clarifying questions instead of using tools. Be conversational and helpful!"""
+
+
+def get_chat_settings():
+    """Get chat settings from environment variables."""
+    return {
+        "openai_api_key": os.getenv("OPENAI_API_KEY"),
+        "model": os.getenv("CHAT_MODEL", "gpt-4o-mini"),
+        "system_prompt": os.getenv("CHAT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
+        "max_tokens": int(os.getenv("CHAT_MAX_TOKENS", "1000")),
+        "response_format": os.getenv("CHAT_RESPONSE_FORMAT", "Short and concise")
+    }
+
 
 class Chat:
     # Class-level cache for API key (loaded once at startup)
@@ -77,10 +51,10 @@ class Chat:
         self._initialize_agent_graph()
     
     def _initialize_client(self):
-        """Initialize OpenAI client with API key from database or env"""
+        """Initialize OpenAI client with API key from env"""
         if Chat._client is None:
-            settings = get_or_create_chat_settings()
-            api_key = settings.get("openai_api_key") or os.getenv("OPENAI_API_KEY")
+            settings = get_chat_settings()
+            api_key = settings.get("openai_api_key")
             Chat._cached_api_key = api_key
             Chat._client = OpenAI(api_key=api_key)
             logger.info("OpenAI client initialized")
@@ -98,25 +72,9 @@ class Chat:
             )
         self.agent_graph = Chat._agent_graph
     
-    @classmethod
-    def reload_api_key(cls):
-        """Reload API key from database (call after updating the key)"""
-        logger.info("Reloading API key and recreating agent graph")
-        settings = get_or_create_chat_settings()
-        api_key = settings.get("openai_api_key") or os.getenv("OPENAI_API_KEY")
-        cls._cached_api_key = api_key
-        cls._client = OpenAI(api_key=api_key)
-        # Also recreate the agent graph with new API key
-        cls._agent_graph = create_agent_graph(
-            model=settings.get("model", "gpt-4o-mini"),
-            system_prompt=settings.get("system_prompt", "You are a helpful assistant."),
-            max_tokens=settings.get("max_tokens", 1000),
-            api_key=api_key
-        )
-    
     def load_settings(self):
-        """Load settings from database (except API key which is cached)"""
-        settings = get_or_create_chat_settings()
+        """Load settings from environment variables"""
+        settings = get_chat_settings()
         self.model = settings["model"]
         self.system_prompt = settings["system_prompt"]
         self.max_tokens = settings["max_tokens"]
@@ -129,7 +87,7 @@ class Chat:
     ) -> str:
         """Generate a response using LangGraph agent"""
         try:
-            # Reload settings to get latest from database
+            # Reload settings to get latest from environment
             self.load_settings()
             logger.info(f"Processing chat request: {message[:50]}..." if len(message) > 50 else f"Processing chat request: {message}")
             
