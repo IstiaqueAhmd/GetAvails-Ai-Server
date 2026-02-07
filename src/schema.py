@@ -55,7 +55,8 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
 
 class ChatResponse(BaseModel):
-    response: str
+    role: str = "assistant"
+    content: str
     session_id: str
     timestamp: datetime
 
@@ -72,7 +73,7 @@ class ChatHistory(BaseModel):
     session_id: str
     messages: List[ChatMessage]
     page: int
-    page_size: int
+    limit: int
     total_messages: int
     total_pages: int
 
