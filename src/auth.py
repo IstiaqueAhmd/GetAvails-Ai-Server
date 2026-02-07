@@ -1,113 +1,53 @@
-from datetime import datetime, timedelta
 from typing import Optional
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy.orm import Session
 import os
 
-from src.database import get_db, User
-
-# JWT Configuration
+# JWT Configuration - uses the same secret as the main backend
 SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-ALGORITHM = os.getenv("JWT_ALGORITHM")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES"))
+ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 
-# Password hashing context
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# OAuth2 scheme for token extraction
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a plain password against a hashed password."""
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password: str) -> str:
-    """Hash a password using bcrypt."""
-    return pwd_context.hash(password)
-
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """
-    Create a JWT access token.
-    
-    Args:
-        data: Dictionary containing the claims to encode in the token
-        expires_delta: Optional custom expiration time
-    
-    Returns:
-        Encoded JWT token as a string
-    """
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
+# OAuth2 scheme for token extraction (tokenUrl is just for OpenAPI docs)
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=True)
 
 
 def decode_access_token(token: str) -> Optional[str]:
     """
-    Decode and validate a JWT token.
+    Decode and validate a JWT token from the main backend.
     
     Args:
         token: JWT token string
     
     Returns:
-        Email from token if valid, None otherwise
+        uid from token if valid, None otherwise
     """
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
+        uid: str = payload.get("uid")
+        if uid is None:
             return None
-        return email
+        return uid
     except JWTError:
         return None
 
 
-def authenticate_user(db: Session, email: str, password: str) -> Optional[User]:
+def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
     """
-    Authenticate a user by email and password.
+    Validate JWT token and extract user ID.
     
-    Args:
-        db: Database session
-        email: User's email
-        password: Plain text password
-    
-    Returns:
-        User object if authentication successful, None otherwise
-    """
-    user = db.query(User).filter(User.email == email).first()
-    if not user:
-        return None
-    if not verify_password(password, user.hashed_password):
-        return None
-    return user
-
-
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
-    """
-    Get the current authenticated user from JWT token.
-    
-    This is a FastAPI dependency that can be used to protect endpoints.
+    This is a FastAPI dependency that validates tokens from the main backend.
+    It does NOT look up users in a local database - just validates the token
+    and returns the uid.
     
     Args:
         token: JWT token from Authorization header
-        db: Database session
     
     Returns:
-        User object
+        User ID (uid) as a string
     
     Raises:
-        HTTPException: If token is invalid or user not found
+        HTTPException: If token is invalid
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -115,58 +55,8 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         headers={"WWW-Authenticate": "Bearer"},
     )
     
-    email = decode_access_token(token)
-    if email is None:
+    uid = decode_access_token(token)
+    if uid is None:
         raise credentials_exception
     
-    user = db.query(User).filter(User.email == email).first()
-    if user is None:
-        raise credentials_exception
-    
-    return user
-
-
-def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
-    """
-    Get the current active user.
-    
-    This dependency ensures the user account is active.
-    
-    Args:
-        current_user: User from get_current_user dependency
-    
-    Returns:
-        User object if active
-    
-    Raises:
-        HTTPException: If user account is inactive
-    """
-    if not current_user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Inactive user account"
-        )
-    return current_user
-
-
-def get_current_admin_user(current_user: User = Depends(get_current_active_user)) -> User:
-    """
-    Get the current user if they have admin privileges.
-    
-    This dependency can be used to protect admin-only endpoints.
-    
-    Args:
-        current_user: User from get_current_active_user dependency
-    
-    Returns:
-        User object if admin
-    
-    Raises:
-        HTTPException: If user is not an admin
-    """
-    if current_user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Admin access required"
-        )
-    return current_user
+    return uid
