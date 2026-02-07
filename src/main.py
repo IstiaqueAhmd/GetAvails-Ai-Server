@@ -333,14 +333,35 @@ async def create_session(
 
 @app.get("/sessions", response_model=SessionList)
 async def get_sessions(
+    search: Optional[str] = None,
+    page: int = 1,
+    limit: int = 20,
     current_user: User = Depends(get_current_active_user),
     db: Session = Depends(get_db)
 ):
-    """Get all chat sessions for the authenticated user"""
+    """
+    Get paginated chat sessions for the authenticated user.
+    
+    - **search**: Optional search query to filter sessions by title
+    - **page**: Page number (default: 1)
+    - **limit**: Number of sessions per page (default: 20, max: 100)
+    """
     try:
+        # Validate pagination parameters
+        limit = min(limit, 100)  # Cap at 100
+        page = max(page, 1)  # Ensure page >= 1
+        
         user_id = str(current_user.id)
-        sessions = get_user_sessions(db, user_id)
-        return SessionList(sessions=sessions)
+        sessions, total = get_user_sessions(db, user_id, search, page, limit)
+        total_pages = (total + limit - 1) // limit  # Ceiling division
+        
+        return SessionList(
+            sessions=sessions,
+            page=page,
+            limit=limit,
+            total=total,
+            total_pages=total_pages
+        )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

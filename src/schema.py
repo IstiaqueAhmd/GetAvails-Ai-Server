@@ -79,6 +79,10 @@ class ChatHistory(BaseModel):
 
 class SessionList(BaseModel):
     sessions: List[ChatSession]
+    page: int
+    limit: int
+    total: int
+    total_pages: int
 
 class TitleUpdateRequest(BaseModel):
     session_id: str

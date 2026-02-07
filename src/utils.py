@@ -48,11 +48,22 @@ def get_chat_history(db: Session, session_id: str, page: int = 1, page_size: int
     
     return [{"role": msg.role, "content": msg.content, "timestamp": msg.timestamp} for msg in messages], total
 
-def get_user_sessions(db: Session, user_id: str) -> List[ChatSession]:
-    """Get all chat sessions for a user"""
-    return db.query(ChatSession).filter(
-        ChatSession.user_id == user_id
-    ).order_by(ChatSession.created_at.desc()).all()
+def get_user_sessions(db: Session, user_id: str, search: str = None, page: int = 1, limit: int = 20) -> tuple:
+    """Get paginated chat sessions for a user with optional search by title"""
+    query = db.query(ChatSession).filter(ChatSession.user_id == user_id)
+    
+    # Apply search filter if provided
+    if search:
+        query = query.filter(ChatSession.title.ilike(f"%{search}%"))
+    
+    # Get total count before pagination
+    total = query.count()
+    
+    # Apply pagination
+    offset = (page - 1) * limit
+    sessions = query.order_by(ChatSession.created_at.desc()).offset(offset).limit(limit).all()
+    
+    return sessions, total
 
 def delete_chat_session(db: Session, session_id: str, user_id: str) -> bool:
     """Delete a chat session and all its messages"""
