@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import List, Dict
 from sqlalchemy.orm import Session
-from src.database import ChatSession, ChatMessage, User, ErrorLog
+from src.database import ChatSession, ChatMessage, ErrorLog
 
 def generate_session_id() -> str:
     """Generate a unique session ID"""
@@ -33,7 +33,7 @@ def save_message(db: Session, session_id: str, role: str, content: str):
     db.add(db_message)
     db.commit()
 
-def get_chat_history(db: Session, session_id: str, page: int = 1, page_size: int = 20) -> tuple[List[Dict[str, str]], int]:
+def get_chat_history(db: Session, session_id: str, page: int = 1, limit: int = 20) -> tuple[List[Dict[str, str]], int]:
     """Get paginated chat history for a session"""
     # Get total count
     total = db.query(ChatMessage).filter(
@@ -41,10 +41,10 @@ def get_chat_history(db: Session, session_id: str, page: int = 1, page_size: int
     ).count()
     
     # Get paginated messages
-    offset = (page - 1) * page_size
+    offset = (page - 1) * limit
     messages = db.query(ChatMessage).filter(
         ChatMessage.session_id == session_id
-    ).order_by(ChatMessage.timestamp).offset(offset).limit(page_size).all()
+    ).order_by(ChatMessage.timestamp).offset(offset).limit(limit).all()
     
     return [{"role": msg.role, "content": msg.content, "timestamp": msg.timestamp} for msg in messages], total
 
@@ -94,13 +94,6 @@ def update_session_title(db: Session, session_id: str, user_id: str, title: str)
         db.commit()
         return True
     return False
-
-def get_username(db: Session, user_id: int) -> str:
-    """Get the username of a user"""
-    user = db.query(User).filter(User.id == user_id).first()
-    if user:
-        return user.username
-    return "User"
 
 def log_error(db: Session, endpoint: str, error: Exception, user_id: str = None):
     """Log an error to the database"""
