@@ -1,11 +1,14 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, Boolean
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 import os
+import logging
 from dotenv import load_dotenv
 
 load_dotenv()  
+
+logger = logging.getLogger(__name__)
 
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -25,23 +28,12 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
-class User(Base):
-    __tablename__ = "users"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True, nullable=False)
-    username = Column(String, nullable=False)
-    hashed_password = Column(String, nullable=False)
-    is_active = Column(Boolean, default=True)
-    role = Column(String, default="user")  # "user" or "admin"
-    created_at = Column(DateTime, default=datetime.utcnow)
-
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
     
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(String, unique=True, index=True)
-    user_id = Column(String, index=True)
+    user_id = Column(String, index=True)  # uid from main backend JWT
     created_at = Column(DateTime, default=datetime.utcnow)
     title = Column(String, default="New Chat")
 
@@ -65,20 +57,20 @@ class ErrorLog(Base):
     user_id = Column(String, nullable=True)  # User who triggered the error (if authenticated)
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
-class ChatSettings(Base):
-    """Stores chat configuration settings (singleton - only one row with id=1)"""
-    __tablename__ = "chat_settings"
-    
-    id = Column(Integer, primary_key=True, default=1)
-    openai_api_key = Column(String, nullable=True)  # OpenAI API key (stored encrypted ideally)
-    model = Column(String, default="gpt-4o-mini")
-    system_prompt = Column(Text, default="You are a helpful assistant.")
-    max_tokens = Column(Integer, default=1000)
-    response_format = Column(String, default="Short and concise")
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-# Create tables
-Base.metadata.create_all(bind=engine, checkfirst=True)
+def init_db():
+    """Initialize database tables. Safe to call multiple times."""
+    try:
+        Base.metadata.create_all(bind=engine, checkfirst=True)
+        logger.info("Database tables initialized successfully")
+    except Exception as e:
+        logger.warning(f"Database initialization warning (may be race condition): {e}")
+        # Tables might already exist from another worker, which is fine
+
+
+# Initialize tables at module load - wrapped in try/except for safety
+init_db()
+
 
 # Dependency to get database session
 def get_db():
