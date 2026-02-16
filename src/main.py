@@ -121,16 +121,39 @@ async def chat_endpoint(
             detail=f"Error processing chat request: {str(e)}"
         )
 
+# Default system prompt for the public landing page agent
+PUBLIC_CHAT_SYSTEM_PROMPT = os.getenv(
+    "PUBLIC_CHAT_SYSTEM_PROMPT",
+    "You are GetAvails AI, a friendly and helpful assistant on the GetAvails landing page. "
+)
+
+# Initialize a shared OpenAI client for the public chat endpoint
+from openai import OpenAI as PublicOpenAI
+_public_chat_client = PublicOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 @app.post("/public/chat", response_model=ChatResponse)
 async def public_chat_endpoint(request: ChatRequest):
     """
     Send a message and get AI response without authentication.
     
-    This endpoint does not require authentication and does not save chat history.
+    This is a generic landing page assistant. It does NOT use RAG or any tools.
+    It does not require authentication and does not save chat history.
     """
     try:
-        # Generate AI response
-        ai_response = chat.generate_response(request.message, None)
+        model = os.getenv("CHAT_MODEL", "gpt-4o-mini")
+        max_tokens = int(os.getenv("CHAT_MAX_TOKENS", "1000"))
+
+        response = _public_chat_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": PUBLIC_CHAT_SYSTEM_PROMPT},
+                {"role": "user", "content": request.message}
+            ],
+            max_tokens=max_tokens,
+            temperature=0.7
+        )
+        
+        ai_response = response.choices[0].message.content.strip()
         
         return ChatResponse(
             role="assistant",
