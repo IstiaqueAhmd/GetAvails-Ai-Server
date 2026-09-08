@@ -166,25 +166,43 @@ if not _public_openai_api_key:
     raise RuntimeError("OPENAI_API_KEY environment variable is not set")
 _public_chat_client = PublicOpenAI(api_key=_public_openai_api_key)
 
+# In-memory (non-persisted) conversation history for the public endpoint.
+from src.public_history import InMemoryHistoryStore
+from src.utils import generate_session_id
+
+_public_history = InMemoryHistoryStore(
+    max_sessions=int(os.getenv("PUBLIC_CHAT_MAX_SESSIONS", "1000")),
+    max_messages=int(os.getenv("PUBLIC_CHAT_MAX_HISTORY_MESSAGES", "20")),
+    ttl_seconds=int(os.getenv("PUBLIC_CHAT_SESSION_TTL", "3600")),
+)
+
 @app.post("/public/chat", response_model=ChatResponse)
 async def public_chat_endpoint(request: ChatRequest):
     """
     Send a message and get AI response without authentication.
     
     This is a generic landing page assistant. It does NOT use RAG or any tools.
-    It does not require authentication and does not save chat history.
+    It does not persist chat history to the database, but it does keep a short,
+    in-memory history per session so the conversation stays coherent.
     """
+    # Use the provided session id, or mint a new one so history can be tracked.
+    # (Never fall back to a shared bucket - that would mix visitors' chats.)
+    session_id = request.session_id or generate_session_id()
+
     try:
         model = os.getenv("CHAT_MODEL", "gpt-4o-mini")
         max_tokens = int(os.getenv("CHAT_MAX_TOKENS", "1000"))
 
+        # Build the message list: system prompt + prior turns + new message.
+        history = _public_history.get(session_id)
+        messages = [{"role": "system", "content": PUBLIC_CHAT_SYSTEM_PROMPT}]
+        messages.extend(history)
+        messages.append({"role": "user", "content": request.content})
+
         response = await run_in_threadpool(
             lambda: _public_chat_client.chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "system", "content": PUBLIC_CHAT_SYSTEM_PROMPT},
-                    {"role": "user", "content": request.content}
-                ],
+                messages=messages,
                 max_tokens=max_tokens,
                 temperature=0.7
             )
@@ -192,10 +210,14 @@ async def public_chat_endpoint(request: ChatRequest):
 
         ai_response = response.choices[0].message.content.strip()
 
+        # Persist this turn to the in-memory history only after a successful call.
+        _public_history.append(session_id, "user", request.content)
+        _public_history.append(session_id, "assistant", ai_response)
+
         return ChatResponse(
             role="assistant",
             content=ai_response,
-            session_id=request.session_id or "public",
+            session_id=session_id,
             timestamp=datetime.utcnow()
         )
 
