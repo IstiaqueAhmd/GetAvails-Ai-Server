@@ -17,13 +17,11 @@ logging.basicConfig(
 logger = logging.getLogger("tour_guide.chat")
 
 # Default system prompt for the tour guide agent
-DEFAULT_SYSTEM_PROMPT = """You are a helpful and friendly AI tour guide assistant called GetAvails. You help users plan trips, find flights, discover destinations, and provide travel advice.
+DEFAULT_SYSTEM_PROMPT = """You are a helpful and friendly AI tour guide assistant called GetAvails. You help users plan trips, discover destinations, and provide travel advice.
 
 IMPORTANT GUIDELINES:
 1. For general conversation, greetings, or unclear messages - respond directly WITHOUT using any tools. Just be friendly and ask how you can help.
-2. Only use the search_flights tool when the user explicitly asks to search for flights AND provides: origin, destination, and travel dates.
-3. Only use get_airport_info when the user specifically asks about airport codes or airports for a city.
-4. Only use get_destination_info when the user asks about travel information for a specific destination.
+2. Only use get_destination_info when the user asks about travel information for a specific destination.
 
 If the user's message is vague or unclear, ask clarifying questions instead of using tools. Be conversational and helpful!"""
 
@@ -35,7 +33,9 @@ def get_chat_settings():
         "model": os.getenv("CHAT_MODEL", "gpt-4o-mini"),
         "system_prompt": os.getenv("CHAT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
         "max_tokens": int(os.getenv("CHAT_MAX_TOKENS", "1000")),
-        "response_format": os.getenv("CHAT_RESPONSE_FORMAT", "Short and concise")
+        "response_format": os.getenv("CHAT_RESPONSE_FORMAT", "Short and concise"),
+        # Cap how many prior messages are sent to the model to bound latency/cost
+        "max_history_messages": int(os.getenv("CHAT_MAX_HISTORY_MESSAGES", "20")),
     }
 
 
@@ -44,34 +44,47 @@ class Chat:
     _cached_api_key = None
     _client = None
     _agent_graph = None
-    
+    # Signature of the settings the cached graph was built with; used to
+    # avoid recompiling the graph on every request.
+    _graph_signature = None
+
     def __init__(self):
         self._initialize_client()
         self.load_settings()
-        self._initialize_agent_graph()
-    
+        self._ensure_agent_graph()
+
     def _initialize_client(self):
         """Initialize OpenAI client with API key from env"""
         if Chat._client is None:
             settings = get_chat_settings()
             api_key = settings.get("openai_api_key")
+            if not api_key:
+                raise RuntimeError(
+                    "OPENAI_API_KEY environment variable is not set"
+                )
             Chat._cached_api_key = api_key
             Chat._client = OpenAI(api_key=api_key)
             logger.info("OpenAI client initialized")
         self.client = Chat._client
-    
-    def _initialize_agent_graph(self):
-        """Initialize the LangGraph agent"""
-        if Chat._agent_graph is None:
-            logger.info("Initializing LangGraph agent")
+
+    def _settings_signature(self):
+        """A hashable snapshot of the settings that affect the compiled graph."""
+        return (self.model, self.system_prompt, self.max_tokens)
+
+    def _ensure_agent_graph(self):
+        """Build the LangGraph agent once, rebuilding only when settings change."""
+        signature = self._settings_signature()
+        if Chat._agent_graph is None or Chat._graph_signature != signature:
+            logger.info("Building LangGraph agent (first run or settings changed)")
             Chat._agent_graph = create_agent_graph(
                 model=self.model,
                 system_prompt=self.system_prompt,
                 max_tokens=self.max_tokens,
                 api_key=Chat._cached_api_key
             )
+            Chat._graph_signature = signature
         self.agent_graph = Chat._agent_graph
-    
+
     def load_settings(self):
         """Load settings from environment variables"""
         settings = get_chat_settings()
@@ -79,6 +92,7 @@ class Chat:
         self.system_prompt = settings["system_prompt"]
         self.max_tokens = settings["max_tokens"]
         self.response_format = settings["response_format"]
+        self.max_history_messages = settings["max_history_messages"]
 
     def generate_response(
         self, 
@@ -87,18 +101,19 @@ class Chat:
     ) -> str:
         """Generate a response using LangGraph agent"""
         try:
-            # Reload settings to get latest from environment
+            # Reload settings to get latest from environment, rebuilding the
+            # compiled graph only when a setting that affects it changed.
             self.load_settings()
+            self._ensure_agent_graph()
             logger.info(f"Processing chat request: {message[:50]}..." if len(message) > 50 else f"Processing chat request: {message}")
-            
-            # Recreate agent graph if settings changed
-            self.agent_graph = create_agent_graph(
-                model=self.model,
-                system_prompt=self.system_prompt,
-                max_tokens=self.max_tokens,
-                api_key=Chat._cached_api_key
-            )
-            
+
+            # Only send the most recent messages to the model to bound latency,
+            # token cost, and the risk of exceeding the context window.
+            if conversation_history:
+                conversation_history = self.get_conversation_context(
+                    conversation_history, max_messages=self.max_history_messages
+                )
+
             # Convert conversation history to LangChain messages
             messages = []
             if conversation_history:

@@ -1,5 +1,7 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy.orm import Session
 from datetime import datetime
@@ -17,32 +19,54 @@ from src.schema import (
 from src.auth import get_current_user
 from src.chat import Chat
 from src.utils import (
-    create_chat_session, 
-    save_message, 
-    get_chat_history, 
+    create_chat_session,
+    save_message,
+    get_chat_history,
     get_user_sessions,
     delete_chat_session,
     update_session_title,
+    session_belongs_to_user,
     log_error
 )
 
 # Check if running in production
 IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").lower() == "production"
 
+# Secret used for both JWT validation and the session middleware. Required.
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not JWT_SECRET_KEY:
+    raise RuntimeError("JWT_SECRET_KEY environment variable is not set")
+
+# Allowed CORS origins. Comma-separated list in ALLOWED_ORIGINS, e.g.
+# "https://app.getavails.com,https://getavails.com". Defaults to localhost for
+# local development. "*" cannot be combined with credentials, so it is not used.
+_allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+ALLOWED_ORIGINS = [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize database and services on startup."""
+    from src.database import init_db
+    init_db()
+    yield
+
+
 # Create FastAPI app with docs disabled in production
 app = FastAPI(
-    title="Houseme Chat API",
-    description="A chat API powered by AI",
+    title="Getavails AI API",
+    description="An API server powered by AI",
     version="1.0.0",
     docs_url=None if IS_PRODUCTION else "/docs",
     redoc_url=None if IS_PRODUCTION else "/redoc",
-    openapi_url=None if IS_PRODUCTION else "/openapi.json"
+    openapi_url=None if IS_PRODUCTION else "/openapi.json",
+    lifespan=lifespan,
 )
 
-# Add CORS middleware
+# Add CORS middleware (explicit origins so credentialed requests work)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this properly for production
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,19 +75,12 @@ app.add_middleware(
 # Add session middleware for OAuth state management
 app.add_middleware(
     SessionMiddleware,
-    secret_key=os.getenv("JWT_SECRET_KEY", "change-this-secret-key"),
+    secret_key=JWT_SECRET_KEY,
     same_site="lax",  # Required for OAuth redirects
-    https_only=False  # Set to True in production with HTTPS
+    https_only=IS_PRODUCTION  # Secure cookies in production (HTTPS)
 )
 
-# Startup event to ensure database is ready
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database and services on startup"""
-    from src.database import init_db
-    init_db()
-
-# Initialize chat service (lazy - will be created on first use)
+# Initialize the chat service (fails fast if OPENAI_API_KEY is missing)
 chat = Chat()
 
 @app.get("/")
@@ -87,38 +104,53 @@ async def chat_endpoint(
     db: Session = Depends(get_db)
 ):
     """Send a message and get AI response (requires authentication)"""
-    try:
-        session_id = request.session_id
+    session_id = request.session_id
 
-        # Get conversation history (all messages for AI context)
-        history, _ = get_chat_history(db, session_id, page=1, limit=1000)
-    
+    # Validate the session id and ownership before doing any work.
+    if not session_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="session_id is required"
+        )
+    if not session_belongs_to_user(db, session_id, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found or access denied"
+        )
+
+    try:
+        # Get recent conversation history for AI context. The chat layer trims
+        # this further before sending it to the model.
+        history, _ = get_chat_history(db, session_id, page=1, limit=50)
+
         # Generate title if this is the first message
         if len(history) == 0:
-            title = chat.generate_title(request.message)
+            title = await run_in_threadpool(chat.generate_title, request.content)
             update_session_title(db, session_id, user_id, title)
 
         # Save user message
-        save_message(db, session_id, "user", request.message)
-        
-        # Generate AI response
-        ai_response = chat.generate_response(request.message, history)
-        
+        save_message(db, session_id, "user", request.content)
+
+        # Generate AI response (blocking network I/O -> run off the event loop)
+        ai_response = await run_in_threadpool(
+            chat.generate_response, request.content, history
+        )
+
         # Save AI response
         save_message(db, session_id, "assistant", ai_response)
-        
+
         return ChatResponse(
             role="assistant",
             content=ai_response,
             session_id=session_id,
             timestamp=datetime.utcnow()
         )
-        
+
     except Exception as e:
         log_error(db, "/chat", e, user_id=user_id)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing chat request: {str(e)}"
+            detail="Error processing chat request"
         )
 
 # Default system prompt for the public landing page agent
@@ -129,7 +161,10 @@ PUBLIC_CHAT_SYSTEM_PROMPT = os.getenv(
 
 # Initialize a shared OpenAI client for the public chat endpoint
 from openai import OpenAI as PublicOpenAI
-_public_chat_client = PublicOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+_public_openai_api_key = os.getenv("OPENAI_API_KEY")
+if not _public_openai_api_key:
+    raise RuntimeError("OPENAI_API_KEY environment variable is not set")
+_public_chat_client = PublicOpenAI(api_key=_public_openai_api_key)
 
 @app.post("/public/chat", response_model=ChatResponse)
 async def public_chat_endpoint(request: ChatRequest):
@@ -143,29 +178,31 @@ async def public_chat_endpoint(request: ChatRequest):
         model = os.getenv("CHAT_MODEL", "gpt-4o-mini")
         max_tokens = int(os.getenv("CHAT_MAX_TOKENS", "1000"))
 
-        response = _public_chat_client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": PUBLIC_CHAT_SYSTEM_PROMPT},
-                {"role": "user", "content": request.message}
-            ],
-            max_tokens=max_tokens,
-            temperature=0.7
+        response = await run_in_threadpool(
+            lambda: _public_chat_client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": PUBLIC_CHAT_SYSTEM_PROMPT},
+                    {"role": "user", "content": request.content}
+                ],
+                max_tokens=max_tokens,
+                temperature=0.7
+            )
         )
-        
+
         ai_response = response.choices[0].message.content.strip()
-        
+
         return ChatResponse(
             role="assistant",
             content=ai_response,
             session_id=request.session_id or "public",
             timestamp=datetime.utcnow()
         )
-        
+
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing chat request: {str(e)}"
+            detail="Error processing chat request"
         )
 
 @app.post("/create-session", response_model=dict)
@@ -181,7 +218,7 @@ async def create_session(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error creating session: {str(e)}"
+            detail="Error creating session"
         )
 
 @app.get("/sessions", response_model=SessionList)
@@ -217,7 +254,7 @@ async def get_sessions(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error retrieving sessions: {str(e)}"
+            detail="Error retrieving sessions"
         )
 
 @app.get("/chat/history", response_model=ChatHistory)
@@ -258,7 +295,7 @@ async def get_session_history(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error retrieving chat history: {str(e)}"
+            detail="Error retrieving chat history"
         )
 
 @app.delete("/delete-session")
@@ -282,7 +319,7 @@ async def delete_session(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error deleting session: {str(e)}"
+            detail="Error deleting session"
         )
 
 @app.put("/sessions/update-title")
@@ -306,9 +343,5 @@ async def update_title(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error updating title: {str(e)}"
+            detail="Error updating title"
         )
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)

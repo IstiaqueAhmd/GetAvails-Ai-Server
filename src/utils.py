@@ -22,6 +22,13 @@ def create_chat_session(db: Session, user_id: str, title: str = "New Chat") -> s
     db.refresh(db_session)
     return session_id
 
+def session_belongs_to_user(db: Session, session_id: str, user_id: str) -> bool:
+    """Return True if the session exists and is owned by the given user."""
+    return db.query(ChatSession).filter(
+        ChatSession.session_id == session_id,
+        ChatSession.user_id == user_id
+    ).first() is not None
+
 def save_message(db: Session, session_id: str, role: str, content: str):
     """Save a message to the database"""
     db_message = ChatMessage(

@@ -9,7 +9,7 @@ class ChatMessage(BaseModel):
     timestamp: Optional[datetime] = None
 
 class ChatRequest(BaseModel):
-    message: str
+    content: str
     session_id: Optional[str] = None
 
 class ChatResponse(BaseModel):

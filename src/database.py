@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set")
 
 # Configure engine based on database type
 if "sqlite" in DATABASE_URL:
@@ -33,7 +35,7 @@ class ChatSession(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(String, unique=True, index=True)
-    user_id = Column(String, index=True)  # uid from main backend JWT
+    user_id = Column(String, index=True)  # user_id from main backend JWT
     created_at = Column(DateTime, default=datetime.utcnow)
     title = Column(String, default="New Chat")
 
@@ -66,10 +68,6 @@ def init_db():
     except Exception as e:
         logger.warning(f"Database initialization warning (may be race condition): {e}")
         # Tables might already exist from another worker, which is fine
-
-
-# Initialize tables at module load - wrapped in try/except for safety
-init_db()
 
 
 # Dependency to get database session
