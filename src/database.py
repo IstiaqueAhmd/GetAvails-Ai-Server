@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text
+from sqlalchemy import create_engine, inspect, text, Column, Integer, String, DateTime, Text, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
@@ -46,6 +46,9 @@ class ChatMessage(Base):
     session_id = Column(String, index=True)
     role = Column(String)  # "user" or "assistant"
     content = Column(Text)
+    # "message", "artists", "venues" or "offer" (see ResponseType in schema.py)
+    response_type = Column(String, nullable=False, default="message", server_default="message")
+    data = Column(JSON, nullable=True)  # Structured tool results shown with this message
     timestamp = Column(DateTime, default=datetime.utcnow)
 
 class ErrorLog(Base):
@@ -60,14 +63,44 @@ class ErrorLog(Base):
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
 
+def _migrate_chat_messages():
+    """
+    Add chat_messages columns introduced after the table was first created.
+
+    create_all() only creates missing tables; it never alters existing ones, so
+    databases created before these columns existed need them added here.
+    Additive and idempotent.
+    """
+    inspector = inspect(engine)
+    if not inspector.has_table("chat_messages"):
+        return
+
+    existing = {col["name"] for col in inspector.get_columns("chat_messages")}
+    statements = []
+    if "response_type" not in existing:
+        statements.append(
+            "ALTER TABLE chat_messages "
+            "ADD COLUMN response_type VARCHAR NOT NULL DEFAULT 'message'"
+        )
+    if "data" not in existing:
+        statements.append("ALTER TABLE chat_messages ADD COLUMN data JSON")
+
+    if statements:
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
+        logger.info(f"Migrated chat_messages: {statements}")
+
+
 def init_db():
     """Initialize database tables. Safe to call multiple times."""
     try:
         Base.metadata.create_all(bind=engine, checkfirst=True)
+        _migrate_chat_messages()
         logger.info("Database tables initialized successfully")
     except Exception as e:
         logger.warning(f"Database initialization warning (may be race condition): {e}")
-        # Tables might already exist from another worker, which is fine
+        # Tables/columns might already exist from another worker, which is fine
 
 
 # Dependency to get database session

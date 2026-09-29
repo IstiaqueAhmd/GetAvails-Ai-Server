@@ -31,13 +31,15 @@ def create_agent_node(model: str, system_prompt: str, max_tokens: int, api_key: 
     Returns:
         A function that processes the agent state
     """
-    # Create the LLM with tools bound
+    # Create the LLM, binding tools only if any exist (OpenAI rejects an empty tools list)
     llm = ChatOpenAI(
         model=model,
         max_tokens=max_tokens,
         temperature=0.7,
         api_key=api_key
-    ).bind_tools(TOOLS)
+    )
+    if TOOLS:
+        llm = llm.bind_tools(TOOLS)
     
     def agent_node(state: AgentState) -> dict:
         """

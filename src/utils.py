@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import List, Dict
+from typing import Any, List, Dict, Optional
 from sqlalchemy.orm import Session
 from src.database import ChatSession, ChatMessage, ErrorLog
 
@@ -29,12 +29,21 @@ def session_belongs_to_user(db: Session, session_id: str, user_id: str) -> bool:
         ChatSession.user_id == user_id
     ).first() is not None
 
-def save_message(db: Session, session_id: str, role: str, content: str):
-    """Save a message to the database"""
+def save_message(
+    db: Session,
+    session_id: str,
+    role: str,
+    content: str,
+    response_type: str = "message",
+    data: Optional[Any] = None
+):
+    """Save a message (and any structured data shown with it) to the database"""
     db_message = ChatMessage(
         session_id=session_id,
         role=role,
         content=content,
+        response_type=response_type,
+        data=data,
         timestamp=datetime.utcnow()
     )
     db.add(db_message)
@@ -53,7 +62,16 @@ def get_chat_history(db: Session, session_id: str, page: int = 1, limit: int = 2
         ChatMessage.session_id == session_id
     ).order_by(ChatMessage.timestamp).offset(offset).limit(limit).all()
     
-    return [{"role": msg.role, "content": msg.content, "timestamp": msg.timestamp} for msg in messages], total
+    return [
+        {
+            "role": msg.role,
+            "content": msg.content,
+            "response_type": msg.response_type or "message",
+            "data": msg.data,
+            "timestamp": msg.timestamp,
+        }
+        for msg in messages
+    ], total
 
 def get_user_sessions(db: Session, user_id: str, search: str = None, page: int = 1, limit: int = 20) -> tuple:
     """Get paginated chat sessions for a user with optional search by title"""

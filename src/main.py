@@ -13,8 +13,8 @@ load_dotenv()
 
 from src.database import get_db, ChatMessage as ChatMessageDB
 from src.schema import (
-    ChatRequest, ChatResponse, ChatHistory, SessionList, ChatSession,
-    TitleUpdateRequest
+    ChatRequest, ChatResponse, PublicChatResponse, ChatHistory, SessionList,
+    ChatSession, TitleUpdateRequest
 )
 from src.auth import get_current_user
 from src.chat import Chat
@@ -132,16 +132,21 @@ async def chat_endpoint(
         save_message(db, session_id, "user", request.content)
 
         # Generate AI response (blocking network I/O -> run off the event loop)
-        ai_response = await run_in_threadpool(
+        result = await run_in_threadpool(
             chat.generate_response, request.content, history
         )
 
-        # Save AI response
-        save_message(db, session_id, "assistant", ai_response)
+        # Save AI response along with any structured tool data
+        save_message(
+            db, session_id, "assistant", result.content,
+            response_type=result.response_type, data=result.data
+        )
 
         return ChatResponse(
             role="assistant",
-            content=ai_response,
+            content=result.content,
+            response_type=result.response_type,
+            data=result.data,
             session_id=session_id,
             timestamp=datetime.utcnow()
         )
@@ -153,10 +158,11 @@ async def chat_endpoint(
             detail="Error processing chat request"
         )
 
-# Default system prompt for the public landing page agent
-PUBLIC_CHAT_SYSTEM_PROMPT = os.getenv(
-    "PUBLIC_CHAT_SYSTEM_PROMPT",
-    "You are GetAvails AI, a friendly and helpful assistant on the GetAvails landing page. "
+# Default system prompt for the public landing page agent (used when the env var is unset or empty)
+PUBLIC_CHAT_SYSTEM_PROMPT = os.getenv("PUBLIC_CHAT_SYSTEM_PROMPT") or (
+    "You are Ava, the friendly AI assistant for GetAvails, speaking with visitors on the GetAvails landing page. "
+    "GetAvails helps artists, venues, and other roles on the platform connect: finding artists and venues, "
+    "sending and understanding offers, and more. Help visitors understand what GetAvails does and how it can help them. "
 )
 
 # Initialize a shared OpenAI client for the public chat endpoint
@@ -176,7 +182,7 @@ _public_history = InMemoryHistoryStore(
     ttl_seconds=int(os.getenv("PUBLIC_CHAT_SESSION_TTL", "3600")),
 )
 
-@app.post("/public/chat", response_model=ChatResponse)
+@app.post("/public/chat", response_model=PublicChatResponse)
 async def public_chat_endpoint(request: ChatRequest):
     """
     Send a message and get AI response without authentication.
@@ -214,7 +220,7 @@ async def public_chat_endpoint(request: ChatRequest):
         _public_history.append(session_id, "user", request.content)
         _public_history.append(session_id, "assistant", ai_response)
 
-        return ChatResponse(
+        return PublicChatResponse(
             role="assistant",
             content=ai_response,
             session_id=session_id,
@@ -294,16 +300,28 @@ async def get_session_history(
     - **page**: Page number (default: 1)
     - **limit**: Number of messages per page (default: 20, max: 100)
     """
+    if not session_belongs_to_user(db, session_id, user_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Session not found or access denied"
+        )
+
     try:
         # Validate limit
         limit = min(limit, 100)  # Cap at 100
         page = max(page, 1)  # Ensure page >= 1
-        
+
         messages, total = get_chat_history(db, session_id, page, limit)
         total_pages = (total + limit - 1) // limit  # Ceiling division
-        
+
         chat_messages = [
-            {"role": msg["role"], "content": msg["content"], "timestamp": msg.get("timestamp", datetime.utcnow())}
+            {
+                "role": msg["role"],
+                "content": msg["content"],
+                "response_type": msg["response_type"],
+                "data": msg["data"],
+                "timestamp": msg.get("timestamp", datetime.utcnow()),
+            }
             for msg in messages
         ]
         return ChatHistory(
