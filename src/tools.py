@@ -10,8 +10,8 @@ response_format="content_and_artifact" and return a (content, artifact) pair:
     - artifact: structured data returned to the client in the /chat `data` field
 Register each such tool's response type in TOOL_RESPONSE_TYPES at the bottom.
 
-search_artists calls the GetAvails backend. search_venues and generate_offer
-still return dummy data; replace their bodies with real lookups and keep the
+search_artists and search_venues call the GetAvails backend. generate_offer
+still returns dummy data; replace its body with a real call and keep the
 (content, artifact) return shape.
 """
 
@@ -138,6 +138,32 @@ def _summarize_artist(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _summarize_venue(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact view of a venue row for the model (see _summarize_artist)."""
+    # SeatGeek reports capacity 0 when it is unknown; don't present that as 0 seats
+    capacity = row.get("capacity") or None
+    if row.get("source") == "seatgeek":
+        return {
+            "id": row.get("id"),
+            "source": "seatgeek",
+            "name": row.get("name"),
+            "address": row.get("address"),
+            "city": row.get("city"),
+            "state": row.get("state"),
+            "capacity": capacity,
+            "popularity_score": row.get("score"),
+        }
+    user = row.get("user") or {}
+    return {
+        "id": row.get("id"),
+        "source": "internal",
+        "name": user.get("name"),
+        "address": row.get("address"),
+        "location": row.get("location"),
+        "capacity": capacity,
+    }
+
+
 def summarize_tool_data(response_type: Optional[str], data: Any) -> Any:
     """
     Compact form of a stored tool artifact, used when replaying chat history
@@ -145,34 +171,9 @@ def summarize_tool_data(response_type: Optional[str], data: Any) -> Any:
     """
     if response_type == "artists" and isinstance(data, list):
         return [_summarize_artist(row) for row in data if isinstance(row, dict)]
+    if response_type == "venues" and isinstance(data, list):
+        return [_summarize_venue(row) for row in data if isinstance(row, dict)]
     return data
-
-
-# ==================== Dummy data (replace with real lookups) ====================
-
-_DUMMY_VENUES: List[Dict[str, Any]] = [
-    {
-        "venue_id": "venue_1",
-        "name": "The Velvet Room",
-        "location": "Austin, TX",
-        "capacity": 350,
-        "venue_type": "Club",
-    },
-    {
-        "venue_id": "venue_2",
-        "name": "Harborfront Amphitheater",
-        "location": "Chicago, IL",
-        "capacity": 4000,
-        "venue_type": "Amphitheater",
-    },
-    {
-        "venue_id": "venue_3",
-        "name": "Neon Loft",
-        "location": "Miami, FL",
-        "capacity": 800,
-        "venue_type": "Lounge",
-    },
-]
 
 
 def _clamp_limit(limit: int) -> int:
@@ -286,25 +287,68 @@ def search_artists(
 @tool(response_format="content_and_artifact")
 def search_venues(
     query: Optional[str] = None,
-    location: Optional[str] = None,
-    min_capacity: Optional[int] = None,
-    limit: int = 5,
-) -> Tuple[str, List[Dict[str, Any]]]:
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    radius_miles: Optional[float] = None,
+    limit: int = 10,
+    offset: int = 0,
+) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
     """
-    Search for venues on GetAvails. Use this when the user wants to find,
-    browse, or get recommendations for venues (e.g. "venues in Austin for 300 people").
+    Search for venues on GetAvails. Results include GetAvails venues
+    (source "internal") first, then SeatGeek venues (source "seatgeek").
+    Use this when the user wants to find, browse, or get recommendations for
+    venues, e.g. "venues in Austin" or "find the Paramount Theatre".
+
+    This search cannot filter by date availability, genre, or capacity. If the
+    user asks for those, search by name/location and say which results fit
+    based on the details returned, without claiming the search filtered them.
 
     Args:
         query: Free-text search, such as a venue name or keywords
-        location: City or region to search in
-        min_capacity: Minimum audience capacity required
-        limit: Maximum number of venues to return (default: 5)
+        latitude: Latitude of the search center. If the user names a place, pass
+            its approximate coordinates. Only applies together with longitude.
+        longitude: Longitude of the search center. Only applies together with latitude.
+        radius_miles: Search radius around the coordinates (defaults to 50 when omitted)
+        limit: Number of venues to return (default 10, max 20)
+        offset: Number of results to skip, used to show more results
     """
-    logger.info(f"search_venues called: query={query}, location={location}, min_capacity={min_capacity}")
+    logger.info(
+        f"search_venues called: query={query}, lat={latitude}, lng={longitude}, "
+        f"radius={radius_miles}, limit={limit}, offset={offset}"
+    )
 
-    # Dummy: filters are ignored until this is wired to real data
-    venues = _DUMMY_VENUES[:_clamp_limit(limit)]
-    return json.dumps(venues), venues
+    params: Dict[str, Any] = {
+        "limit": _clamp_limit(limit),
+        "offset": max(0, offset),
+    }
+    if query:
+        params["q"] = query
+    if latitude is not None and longitude is not None:
+        params["latitude"] = latitude
+        params["longitude"] = longitude
+        if radius_miles is not None:
+            params["radius_miles"] = radius_miles
+
+    try:
+        response = _backend().get("/catalog/venues/", params=params)
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError) as e:
+        logger.error(f"Venue search request failed: {e}")
+        return "Venue search is temporarily unavailable. Please try again shortly.", None
+
+    venues = body.get("results") or []
+    if not venues:
+        # No artifact: the reply is a plain message rather than an empty card list
+        return "No venues matched these filters.", None
+
+    content = json.dumps({
+        "total_matches": body.get("count"),
+        "offset": params["offset"],
+        "returned": len(venues),
+        "venues": [_summarize_venue(row) for row in venues],
+    })
+    return content, venues
 
 
 @tool(response_format="content_and_artifact")
@@ -322,12 +366,11 @@ def generate_offer(
 
     Only use this once you know the artist, the venue, the event date, and the
     fee. If any of these are missing, ask the user instead of guessing. Use the
-    artist `id` returned by search_artists and the venue_id returned by
-    search_venues.
+    `id` values returned by search_artists and search_venues.
 
     Args:
         artist_id: ID of the artist the offer is for (the `id` from search_artists)
-        venue_id: ID of the venue hosting the event
+        venue_id: ID of the venue hosting the event (the `id` from search_venues)
         event_date: Event date in YYYY-MM-DD format
         fee: Offered performance fee
         currency: Currency code for the fee (default: "USD")
@@ -335,14 +378,11 @@ def generate_offer(
     """
     logger.info(f"generate_offer called: artist={artist_id}, venue={venue_id}, date={event_date}, fee={fee}")
 
-    venue = next((v for v in _DUMMY_VENUES if v["venue_id"] == venue_id), None)
-
     offer = {
         "offer_id": f"offer_{uuid.uuid4().hex[:8]}",
         "status": "draft",
         "artist_id": artist_id,
         "venue_id": venue_id,
-        "venue_name": venue["name"] if venue else None,
         "event_date": event_date,
         "fee": fee,
         "currency": currency.upper(),
