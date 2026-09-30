@@ -10,7 +10,8 @@ response_format="content_and_artifact" and return a (content, artifact) pair:
     - artifact: structured data returned to the client in the /chat `data` field
 Register each such tool's response type in TOOL_RESPONSE_TYPES at the bottom.
 
-search_artists and search_venues call the GetAvails backend. generate_offer
+search_artists and search_venues call the GetAvails backend. web_search calls
+Tavily for external information and returns text only (no artifact). generate_offer
 still returns dummy data; replace its body with a real call and keep the
 (content, artifact) return shape.
 """
@@ -23,10 +24,12 @@ import threading
 import time
 import uuid
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
+from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool, tool
+from langgraph.prebuilt import InjectedState
 
 # Configure logger for tools
 logger = logging.getLogger("tour_guide.tools")
@@ -178,6 +181,25 @@ def summarize_tool_data(response_type: Optional[str], data: Any) -> Any:
 
 def _clamp_limit(limit: int) -> int:
     return max(1, min(limit, 20))
+
+
+# ==================== Tavily web search client ====================
+
+TAVILY_API_URL = "https://api.tavily.com/search"
+# Cap each page excerpt so a handful of results doesn't flood the model's context
+_WEB_SNIPPET_MAX_CHARS = 800
+
+_tavily_http: Optional[httpx.Client] = None
+
+
+def _tavily() -> httpx.Client:
+    """Shared HTTP client for Tavily (created lazily, thread-safe)."""
+    global _tavily_http
+    if _tavily_http is None:
+        with _http_lock:
+            if _tavily_http is None:
+                _tavily_http = httpx.Client(timeout=float(os.getenv("TAVILY_API_TIMEOUT", "20")))
+    return _tavily_http
 
 
 # ==================== Tools ====================
@@ -392,8 +414,93 @@ def generate_offer(
     return json.dumps(offer), offer
 
 
+def _platform_searched_this_turn(messages: Sequence[BaseMessage]) -> bool:
+    """True if search_artists or search_venues ran since the latest user message."""
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage):
+            return False
+        if isinstance(m, ToolMessage) and m.name in (search_artists.name, search_venues.name):
+            return True
+    return False
+
+
+@tool
+def web_search(
+    query: str,
+    max_results: int = 5,
+    state: Annotated[dict, InjectedState] = None,
+) -> str:
+    """
+    Search the public web for information that GetAvails does not have, such
+    as a venue's parking, box office hours, age policy, seating chart, history,
+    or an artist's recent news, discography, or social links.
+
+    Always check the platform first: for questions about a specific artist or
+    venue, call search_artists or search_venues before this tool, and only use
+    web_search when those results are missing or don't contain what the user
+    asked for. Never use it to find or recommend artists or venues to book.
+
+    Args:
+        query: A specific search query. Include the full name and city of the
+            artist or venue plus the detail wanted, e.g.
+            "Paramount Theatre Austin TX parking and box office hours"
+        max_results: Number of web results to return (default 5, max 10)
+    """
+    logger.info(f"web_search called: query={query}, max_results={max_results}")
+
+    # Enforce platform-first: GetAvails data must be checked before the web
+    if state is not None and not _platform_searched_this_turn(state.get("messages", [])):
+        logger.info("web_search deferred: no platform search yet this turn")
+        return (
+            "Check GetAvails first: call search_venues or search_artists for the "
+            "venue or artist in question. Call web_search again only if the "
+            "platform results don't answer the user's question."
+        )
+
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        logger.error("web_search called but TAVILY_API_KEY is not set")
+        return "Web search is not configured, so external information is unavailable."
+
+    payload = {
+        "query": query,
+        "search_depth": "basic",
+        "max_results": max(1, min(max_results, 10)),
+        "include_answer": True,
+    }
+    try:
+        response = _tavily().post(
+            TAVILY_API_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        response.raise_for_status()
+        body = response.json()
+    except (httpx.HTTPError, ValueError) as e:
+        logger.error(f"Web search request failed: {e}")
+        return "Web search is temporarily unavailable. Please try again shortly."
+
+    results = [
+        {
+            "title": r.get("title"),
+            "url": r.get("url"),
+            "content": (r.get("content") or "")[:_WEB_SNIPPET_MAX_CHARS],
+        }
+        for r in body.get("results") or []
+    ]
+    if not results and not body.get("answer"):
+        return "The web search found nothing relevant for this query."
+
+    return json.dumps({
+        "source": "web",
+        "note": "External web results, not GetAvails data. Mention the source when using them.",
+        "answer": body.get("answer"),
+        "results": results,
+    })
+
+
 # List of all available tools for the agent
-TOOLS: list[BaseTool] = [search_artists, search_venues, generate_offer]
+TOOLS: list[BaseTool] = [search_artists, search_venues, generate_offer, web_search]
 
 # Maps a tool name to the /chat `response_type` used when that tool produced
 # the reply's structured data. Tools not listed here yield "message".
