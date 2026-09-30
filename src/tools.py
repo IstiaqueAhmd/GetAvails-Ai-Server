@@ -24,12 +24,10 @@ import threading
 import time
 import uuid
 from datetime import date, datetime
-from typing import Annotated, Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import BaseTool, tool
-from langgraph.prebuilt import InjectedState
 
 # Configure logger for tools
 logger = logging.getLogger("tour_guide.tools")
@@ -414,22 +412,8 @@ def generate_offer(
     return json.dumps(offer), offer
 
 
-def _platform_searched_this_turn(messages: Sequence[BaseMessage]) -> bool:
-    """True if search_artists or search_venues ran since the latest user message."""
-    for m in reversed(messages):
-        if isinstance(m, HumanMessage):
-            return False
-        if isinstance(m, ToolMessage) and m.name in (search_artists.name, search_venues.name):
-            return True
-    return False
-
-
 @tool
-def web_search(
-    query: str,
-    max_results: int = 5,
-    state: Annotated[dict, InjectedState] = None,
-) -> str:
+def web_search(query: str, max_results: int = 5) -> str:
     """
     Search the public web for information that GetAvails does not have, such
     as a venue's parking, box office hours, age policy, seating chart, history,
@@ -446,16 +430,8 @@ def web_search(
             "Paramount Theatre Austin TX parking and box office hours"
         max_results: Number of web results to return (default 5, max 10)
     """
+    # Platform-first ordering is enforced by the platform_first middleware in src/agent.py
     logger.info(f"web_search called: query={query}, max_results={max_results}")
-
-    # Enforce platform-first: GetAvails data must be checked before the web
-    if state is not None and not _platform_searched_this_turn(state.get("messages", [])):
-        logger.info("web_search deferred: no platform search yet this turn")
-        return (
-            "Check GetAvails first: call search_venues or search_artists for the "
-            "venue or artist in question. Call web_search again only if the "
-            "platform results don't answer the user's question."
-        )
 
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
@@ -509,4 +485,12 @@ TOOL_RESPONSE_TYPES: Dict[str, str] = {
     search_artists.name: "artists",
     search_venues.name: "venues",
     generate_offer.name: "offer",
+}
+
+# Progress text streamed to the client (/chat/stream) while a tool runs
+TOOL_STATUS_MESSAGES: Dict[str, str] = {
+    search_artists.name: "Searching artists on GetAvails…",
+    search_venues.name: "Searching venues on GetAvails…",
+    generate_offer.name: "Drafting the offer…",
+    web_search.name: "Searching the web…",
 }

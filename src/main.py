@@ -1,17 +1,21 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 from starlette.middleware.sessions import SessionMiddleware
 from sqlalchemy.orm import Session
 from datetime import datetime
 from typing import Optional
+import json
+import logging
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from src.database import get_db, ChatMessage as ChatMessageDB
+from src.database import get_db, SessionLocal, ChatMessage as ChatMessageDB
 from src.schema import (
     ChatRequest, ChatResponse, PublicChatResponse, ChatHistory, SessionList,
     ChatSession, TitleUpdateRequest
@@ -22,12 +26,16 @@ from src.utils import (
     create_chat_session,
     save_message,
     get_chat_history,
+    get_agent_context,
+    update_session_summary,
     get_user_sessions,
     delete_chat_session,
     update_session_title,
     session_belongs_to_user,
     log_error
 )
+
+logger = logging.getLogger("tour_guide.api")
 
 # Check if running in production
 IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").lower() == "production"
@@ -97,16 +105,15 @@ async def health_check():
 
 # ==================== Chat Endpoints ====================
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(
-    request: ChatRequest,
-    user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Send a message and get AI response (requires authentication)"""
-    session_id = request.session_id
+# Messages sent to the model in full; once a chat has more unsummarized
+# messages than this, older ones are folded into the session summary.
+CHAT_MAX_HISTORY_MESSAGES = int(os.getenv("CHAT_MAX_HISTORY_MESSAGES", "20"))
+# Most recent messages kept in full when older ones are summarized
+CHAT_SUMMARY_KEEP_RECENT = int(os.getenv("CHAT_SUMMARY_KEEP_RECENT", "8"))
 
-    # Validate the session id and ownership before doing any work.
+
+def _require_owned_session(db: Session, session_id: Optional[str], user_id: str) -> str:
+    """Validate the session id and ownership before doing any work."""
     if not session_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -117,23 +124,60 @@ async def chat_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Session not found or access denied"
         )
+    return session_id
+
+
+async def _start_turn(db: Session, session_id: str, user_id: str, content: str):
+    """
+    Load the agent's context for a new user message, title the session on its
+    first message, and save the message. Returns (summary, history).
+    """
+    summary, history = get_agent_context(db, session_id, CHAT_MAX_HISTORY_MESSAGES)
+    if summary is None and not history:
+        title = await run_in_threadpool(chat.generate_title, content)
+        update_session_title(db, session_id, user_id, title)
+    save_message(db, session_id, "user", content)
+    return summary, history
+
+
+def _refresh_summary(session_id: str) -> None:
+    """
+    Fold older messages into the session summary once the unsummarized part
+    of the chat grows past CHAT_MAX_HISTORY_MESSAGES. Runs after the reply is
+    sent, so it never delays a response.
+    """
+    db = SessionLocal()
+    try:
+        summary, messages = get_agent_context(db, session_id, max_messages=200)
+        if len(messages) <= CHAT_MAX_HISTORY_MESSAGES:
+            return
+        to_fold = messages[:-CHAT_SUMMARY_KEEP_RECENT]
+        new_summary = chat.summarize_conversation(summary, to_fold)
+        if new_summary:
+            update_session_summary(db, session_id, new_summary, to_fold[-1]["id"])
+            logger.info(f"Summarized {len(to_fold)} messages for session {session_id}")
+    except Exception as e:
+        logger.warning(f"Summary refresh failed for session {session_id}: {e}")
+    finally:
+        db.close()
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(
+    request: ChatRequest,
+    background_tasks: BackgroundTasks,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Send a message and get AI response (requires authentication)"""
+    session_id = _require_owned_session(db, request.session_id, user_id)
 
     try:
-        # Get recent conversation history for AI context. The chat layer trims
-        # this further before sending it to the model.
-        history, _ = get_chat_history(db, session_id, page=1, limit=50)
-
-        # Generate title if this is the first message
-        if len(history) == 0:
-            title = await run_in_threadpool(chat.generate_title, request.content)
-            update_session_title(db, session_id, user_id, title)
-
-        # Save user message
-        save_message(db, session_id, "user", request.content)
+        summary, history = await _start_turn(db, session_id, user_id, request.content)
 
         # Generate AI response (blocking network I/O -> run off the event loop)
         result = await run_in_threadpool(
-            chat.generate_response, request.content, history
+            chat.generate_response, request.content, history, summary
         )
 
         # Save AI response along with any structured tool data
@@ -141,6 +185,7 @@ async def chat_endpoint(
             db, session_id, "assistant", result.content,
             response_type=result.response_type, data=result.data
         )
+        background_tasks.add_task(_refresh_summary, session_id)
 
         return ChatResponse(
             role="assistant",
@@ -158,19 +203,82 @@ async def chat_endpoint(
             detail="Error processing chat request"
         )
 
+
+def _sse(event: str, payload: dict) -> str:
+    """Format one Server-Sent Event."""
+    return f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
+
+
+@app.post("/chat/stream")
+async def chat_stream_endpoint(
+    request: ChatRequest,
+    user_id: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Same as /chat, but streams the reply as Server-Sent Events (requires authentication).
+
+    Events, in order:
+        status  {"tool", "message"}  a tool started, e.g. "Searching venues on GetAvails…"
+        token   {"text"}             a piece of the reply as it's written
+        done    ChatResponse fields  the final reply; always the last event
+
+    Tokens are a live preview: replace the streamed text with `done.content`,
+    which is the saved, authoritative reply (with any cards in `data`).
+    """
+    session_id = _require_owned_session(db, request.session_id, user_id)
+    try:
+        summary, history = await _start_turn(db, session_id, user_id, request.content)
+    except Exception as e:
+        log_error(db, "/chat/stream", e, user_id=user_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error processing chat request"
+        )
+
+    def events():
+        # Runs in a worker thread after the endpoint returns, so it uses its
+        # own DB session rather than the request-scoped one.
+        for event in chat.stream_response(request.content, history, summary):
+            if event["type"] != "done":
+                yield _sse(event["type"], {k: v for k, v in event.items() if k != "type"})
+                continue
+
+            result = event["result"]
+            stream_db = SessionLocal()
+            try:
+                save_message(
+                    stream_db, session_id, "assistant", result.content,
+                    response_type=result.response_type, data=result.data
+                )
+            except Exception as e:
+                log_error(stream_db, "/chat/stream", e, user_id=user_id)
+            finally:
+                stream_db.close()
+
+            yield _sse("done", ChatResponse(
+                role="assistant",
+                content=result.content,
+                response_type=result.response_type,
+                data=result.data,
+                session_id=session_id,
+                timestamp=datetime.utcnow()
+            ).model_dump(mode="json"))
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        # Keep proxies (e.g. nginx) from buffering the stream
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        background=BackgroundTask(_refresh_summary, session_id),
+    )
+
 # Default system prompt for the public landing page agent (used when the env var is unset or empty)
 PUBLIC_CHAT_SYSTEM_PROMPT = os.getenv("PUBLIC_CHAT_SYSTEM_PROMPT") or (
     "You are Ava, the friendly AI assistant for GetAvails, speaking with visitors on the GetAvails landing page. "
     "GetAvails helps artists, venues, and other roles on the platform connect: finding artists and venues, "
     "sending and understanding offers, and more. Help visitors understand what GetAvails does and how it can help them. "
 )
-
-# Initialize a shared OpenAI client for the public chat endpoint
-from openai import OpenAI as PublicOpenAI
-_public_openai_api_key = os.getenv("OPENAI_API_KEY")
-if not _public_openai_api_key:
-    raise RuntimeError("OPENAI_API_KEY environment variable is not set")
-_public_chat_client = PublicOpenAI(api_key=_public_openai_api_key)
 
 # In-memory (non-persisted) conversation history for the public endpoint.
 from src.public_history import InMemoryHistoryStore
@@ -196,25 +304,26 @@ async def public_chat_endpoint(request: ChatRequest):
     session_id = request.session_id or generate_session_id()
 
     try:
-        model = os.getenv("CHAT_MODEL", "gpt-4o-mini")
-        max_tokens = int(os.getenv("CHAT_MAX_TOKENS", "1000"))
+        settings = chat.settings
 
-        # Build the message list: system prompt + prior turns + new message.
-        history = _public_history.get(session_id)
-        messages = [{"role": "system", "content": PUBLIC_CHAT_SYSTEM_PROMPT}]
-        messages.extend(history)
+        # Prior turns + new message; the system prompt goes in `instructions`
+        messages = list(_public_history.get(session_id))
         messages.append({"role": "user", "content": request.content})
 
         response = await run_in_threadpool(
-            lambda: _public_chat_client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.7
+            lambda: chat.client.responses.create(
+                model=settings.model,
+                instructions=PUBLIC_CHAT_SYSTEM_PROMPT,
+                input=messages,
+                max_output_tokens=settings.max_tokens,
+                store=False,
+                **({"reasoning": {"effort": settings.reasoning_effort}} if settings.reasoning_effort else {})
             )
         )
 
-        ai_response = response.choices[0].message.content.strip()
+        ai_response = response.output_text.strip()
+        if not ai_response:
+            raise RuntimeError(f"Empty public chat response (status={response.status})")
 
         # Persist this turn to the in-memory history only after a successful call.
         _public_history.append(session_id, "user", request.content)

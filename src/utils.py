@@ -73,6 +73,42 @@ def get_chat_history(db: Session, session_id: str, page: int = 1, limit: int = 2
         for msg in messages
     ], total
 
+def get_agent_context(db: Session, session_id: str, max_messages: int) -> tuple[Optional[str], List[Dict[str, Any]]]:
+    """
+    Conversation context for the agent: the session's running summary plus the
+    most recent messages not yet folded into it (newest last, at most
+    max_messages of them).
+    """
+    session = db.query(ChatSession).filter(ChatSession.session_id == session_id).first()
+    summary = session.summary if session else None
+    upto_id = session.summary_upto_id if session else None
+
+    query = db.query(ChatMessage).filter(ChatMessage.session_id == session_id)
+    if upto_id is not None:
+        query = query.filter(ChatMessage.id > upto_id)
+    # Take the newest rows, then restore chronological order
+    rows = query.order_by(ChatMessage.id.desc()).limit(max_messages).all()
+    rows.reverse()
+
+    return summary, [
+        {
+            "id": msg.id,
+            "role": msg.role,
+            "content": msg.content,
+            "response_type": msg.response_type or "message",
+            "data": msg.data,
+        }
+        for msg in rows
+    ]
+
+def update_session_summary(db: Session, session_id: str, summary: str, upto_id: int) -> None:
+    """Store a new running summary covering messages up to and including upto_id."""
+    session = db.query(ChatSession).filter(ChatSession.session_id == session_id).first()
+    if session:
+        session.summary = summary
+        session.summary_upto_id = upto_id
+        db.commit()
+
 def get_user_sessions(db: Session, user_id: str, search: str = None, page: int = 1, limit: int = 20) -> tuple:
     """Get paginated chat sessions for a user with optional search by title"""
     query = db.query(ChatSession).filter(ChatSession.user_id == user_id)
