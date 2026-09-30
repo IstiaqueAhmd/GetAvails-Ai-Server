@@ -1,14 +1,13 @@
 from openai import OpenAI
 from dataclasses import dataclass
-from typing import Any, List, Dict, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 import json
-import os
 import logging
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, ToolMessage
 
-from src.graphs import create_agent_graph
-from src.tools import TOOL_RESPONSE_TYPES, summarize_tool_data
+from src.agent import AgentContext, AgentSettings, build_agent, load_agent_settings
+from src.tools import TOOL_RESPONSE_TYPES, TOOL_STATUS_MESSAGES, summarize_tool_data
 
 load_dotenv()
 
@@ -31,6 +30,16 @@ IMPORTANT GUIDELINES:
 
 If the user's message is vague or unclear, ask clarifying questions instead of using tools. Be conversational and helpful!"""
 
+SUMMARY_INSTRUCTIONS = """You maintain a running summary of a conversation between a user and Ava, the GetAvails assistant.
+Update the existing summary with the new messages. Keep what later replies may depend on: the user's role and goals, artists/venues discussed (with their ids and sources), dates, locations, fees, offers drafted, preferences, and open questions.
+Drop small talk. Write plain, compact notes (no more than ~250 words). Respond with only the updated summary."""
+
+# Reply used when the agent stops without producing a usable answer
+FALLBACK_REPLY = (
+    "I got a bit confused processing your request. Could you please rephrase or "
+    "provide more specific details about what you'd like help with?"
+)
+
 
 @dataclass
 class ChatResult:
@@ -40,158 +49,144 @@ class ChatResult:
     data: Optional[Any] = None
 
 
-def get_chat_settings():
-    """Get chat settings from environment variables."""
-    return {
-        "openai_api_key": os.getenv("OPENAI_API_KEY"),
-        "model": os.getenv("CHAT_MODEL", "gpt-4o-mini"),
-        "system_prompt": os.getenv("CHAT_SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT,
-        "max_tokens": int(os.getenv("CHAT_MAX_TOKENS", "1000")),
-        "response_format": os.getenv("CHAT_RESPONSE_FORMAT", "Short and concise"),
-        # Cap how many prior messages are sent to the model to bound latency/cost
-        "max_history_messages": int(os.getenv("CHAT_MAX_HISTORY_MESSAGES", "20")),
-    }
+def _friendly_error(e: Exception) -> str:
+    """User-facing message for an agent failure, without exposing API details."""
+    error_str = str(e).lower()
+    if "insufficient_quota" in error_str or "429" in error_str or "exceeded" in error_str:
+        return "Sorry, the service is currently unavailable due to high demand. Please try again later."
+    if "invalid_api_key" in error_str or "401" in error_str or "api_key" in error_str:
+        return "Sorry, there's a configuration issue with the service. Please contact support."
+    if "rate_limit" in error_str:
+        return "Sorry, the service is experiencing high traffic. Please wait a moment and try again."
+    if "timeout" in error_str or "connection" in error_str:
+        return "Sorry, the service is temporarily unavailable. Please try again in a moment."
+    return "Sorry, something went wrong. Please try again later."
 
 
 class Chat:
-    # Class-level cache for API key (loaded once at startup)
-    _cached_api_key = None
-    _client = None
-    _agent_graph = None
-    # Signature of the settings the cached graph was built with; used to
-    # avoid recompiling the graph on every request.
-    _graph_signature = None
+    # Agent compiled once per process, rebuilt only when its settings change
+    _agent = None
+    _agent_settings: Optional[AgentSettings] = None
 
     def __init__(self):
-        self._initialize_client()
-        self.load_settings()
-        self._ensure_agent_graph()
+        self.settings = load_agent_settings(DEFAULT_SYSTEM_PROMPT)
+        self.client = OpenAI(api_key=self.settings.api_key)
+        self._ensure_agent()
 
-    def _initialize_client(self):
-        """Initialize OpenAI client with API key from env"""
-        if Chat._client is None:
-            settings = get_chat_settings()
-            api_key = settings.get("openai_api_key")
-            if not api_key:
-                raise RuntimeError(
-                    "OPENAI_API_KEY environment variable is not set"
-                )
-            Chat._cached_api_key = api_key
-            Chat._client = OpenAI(api_key=api_key)
-            logger.info("OpenAI client initialized")
-        self.client = Chat._client
+    def _ensure_agent(self):
+        """Reload settings from the environment and rebuild the agent if they changed."""
+        self.settings = load_agent_settings(DEFAULT_SYSTEM_PROMPT)
+        if Chat._agent is None or Chat._agent_settings != self.settings:
+            Chat._agent = build_agent(self.settings)
+            Chat._agent_settings = self.settings
+        self.agent = Chat._agent
 
-    def _settings_signature(self):
-        """A hashable snapshot of the settings that affect the compiled graph."""
-        return (self.model, self.system_prompt, self.max_tokens)
+    # ==================== Agent turns ====================
 
-    def _ensure_agent_graph(self):
-        """Build the LangGraph agent once, rebuilding only when settings change."""
-        signature = self._settings_signature()
-        if Chat._agent_graph is None or Chat._graph_signature != signature:
-            logger.info("Building LangGraph agent (first run or settings changed)")
-            Chat._agent_graph = create_agent_graph(
-                model=self.model,
-                system_prompt=self.system_prompt,
-                max_tokens=self.max_tokens,
-                api_key=Chat._cached_api_key
-            )
-            Chat._graph_signature = signature
-        self.agent_graph = Chat._agent_graph
+    @staticmethod
+    def _build_messages(message: str, history: Optional[List[Dict[str, Any]]]) -> List[BaseMessage]:
+        """Convert stored history plus the new user message into LangChain messages."""
+        messages: List[BaseMessage] = []
+        for msg in history or []:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                # Include structured data shown with earlier replies so the
+                # model can refer back to it (e.g. "offer the first artist").
+                # Use the compact summary; full rows are for the client.
+                data = msg.get("data")
+                if data is not None:
+                    response_type = msg.get("response_type")
+                    summary = summarize_tool_data(response_type, data)
+                    content = (
+                        f"{content}\n\n(Context: {response_type} data shown "
+                        f"to the user with this reply: {json.dumps(summary)})"
+                    )
+                messages.append(AIMessage(content=content))
+        messages.append(HumanMessage(content=message))
+        return messages
 
-    def load_settings(self):
-        """Load settings from environment variables"""
-        settings = get_chat_settings()
-        self.model = settings["model"]
-        self.system_prompt = settings["system_prompt"]
-        self.max_tokens = settings["max_tokens"]
-        self.response_format = settings["response_format"]
-        self.max_history_messages = settings["max_history_messages"]
+    def _result_from_messages(self, messages: List[BaseMessage]) -> ChatResult:
+        """Final reply text plus this turn's structured tool data."""
+        final = messages[-1] if messages else None
+        content = final.text.strip() if isinstance(final, AIMessage) and not final.tool_calls else ""
+        response_type, data = self._extract_structured_result(messages)
+        if not content:
+            # e.g. a call limit stopped the agent mid tool loop
+            logger.warning("Agent ended without a final text reply")
+            content = FALLBACK_REPLY
+        logger.info(f"Agent response ready ({len(content)} chars, response_type={response_type})")
+        return ChatResult(content=content, response_type=response_type, data=data)
 
     def generate_response(
         self,
         message: str,
-        conversation_history: List[Dict[str, Any]] = None
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        conversation_summary: Optional[str] = None,
     ) -> ChatResult:
-        """Generate a response (and any structured tool data) using the LangGraph agent"""
+        """Generate a response (and any structured tool data) using the agent."""
         try:
-            # Reload settings to get latest from environment, rebuilding the
-            # compiled graph only when a setting that affects it changed.
-            self.load_settings()
-            self._ensure_agent_graph()
-            logger.info(f"Processing chat request: {message[:50]}..." if len(message) > 50 else f"Processing chat request: {message}")
-
-            # Only send the most recent messages to the model to bound latency,
-            # token cost, and the risk of exceeding the context window.
-            if conversation_history:
-                conversation_history = self.get_conversation_context(
-                    conversation_history, max_messages=self.max_history_messages
-                )
-
-            # Convert conversation history to LangChain messages
-            messages = []
-            if conversation_history:
-                for msg in conversation_history:
-                    role = msg.get("role", "")
-                    content = msg.get("content", "")
-                    if role == "user":
-                        messages.append(HumanMessage(content=content))
-                    elif role == "assistant":
-                        # Include structured data shown with earlier replies so the
-                        # model can refer back to it (e.g. "offer the first artist").
-                        # Use the compact summary; full rows are for the client.
-                        data = msg.get("data")
-                        if data is not None:
-                            response_type = msg.get("response_type")
-                            summary = summarize_tool_data(response_type, data)
-                            content = (
-                                f"{content}\n\n(Context: {response_type} data shown "
-                                f"to the user with this reply: {json.dumps(summary)})"
-                            )
-                        messages.append(AIMessage(content=content))
-
-            # Add current message
-            messages.append(HumanMessage(content=message))
-
-            logger.info(f"Invoking agent graph with {len(messages)} messages")
-
-            # Invoke the agent graph with recursion limit to prevent infinite loops
-            # Max 10 tool calls per request (5 round trips of agent -> tool -> agent)
-            config = {"recursion_limit": 10}
-            result = self.agent_graph.invoke({"messages": messages}, config=config)
-
-            # Extract the final response and any structured tool data from this turn
-            final_message = result["messages"][-1]
-            response_type, data = self._extract_structured_result(result["messages"])
-            logger.info(
-                f"Agent response received ({len(final_message.content)} chars, "
-                f"response_type={response_type})"
+            self._ensure_agent()
+            logger.info(f"Processing chat request: {message[:50]}")
+            messages = self._build_messages(message, conversation_history)
+            result = self.agent.invoke(
+                {"messages": messages},
+                context=AgentContext(conversation_summary=conversation_summary),
             )
-            return ChatResult(
-                content=final_message.content,
-                response_type=response_type,
-                data=data
-            )
-
+            return self._result_from_messages(result["messages"])
         except Exception as e:
-            # Return user-friendly error messages without exposing API details
-            error_str = str(e).lower()
-            logger.error(f"Error in generate_response: {error_str}")
-            
-            if "recursion" in error_str or "limit" in error_str:
-                logger.warning("Agent hit recursion limit - possible tool loop detected")
-                return ChatResult("I got a bit confused processing your request. Could you please rephrase or provide more specific details about what you'd like help with?")
-            elif "insufficient_quota" in error_str or "429" in error_str or "exceeded" in error_str:
-                return ChatResult("Sorry, the service is currently unavailable due to high demand. Please try again later.")
-            elif "invalid_api_key" in error_str or "401" in error_str or "api_key" in error_str:
-                return ChatResult("Sorry, there's a configuration issue with the service. Please contact support.")
-            elif "rate_limit" in error_str:
-                return ChatResult("Sorry, the service is experiencing high traffic. Please wait a moment and try again.")
-            elif "timeout" in error_str or "connection" in error_str:
-                return ChatResult("Sorry, the service is temporarily unavailable. Please try again in a moment.")
-            else:
-                # Generic error message that doesn't expose internals
-                return ChatResult("Sorry, something went wrong. Please try again later.")
+            logger.exception(f"Error in generate_response: {e}")
+            return ChatResult(_friendly_error(e))
+
+    def stream_response(
+        self,
+        message: str,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        conversation_summary: Optional[str] = None,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        Run the agent and yield events as it works:
+
+            {"type": "status", "tool": name, "message": text}   a tool started
+            {"type": "token", "text": delta}                    reply text as it is written
+            {"type": "done", "result": ChatResult}              always last
+
+        Tokens are a live preview. Text written before a tool call, or by a
+        failed model before a fallback, can show up in them, so clients should
+        replace the streamed text with the final `done` content.
+        """
+        try:
+            self._ensure_agent()
+            logger.info(f"Processing streamed chat request: {message[:50]}")
+            messages = self._build_messages(message, conversation_history)
+            for mode, chunk in self.agent.stream(
+                {"messages": messages},
+                context=AgentContext(conversation_summary=conversation_summary),
+                stream_mode=["messages", "updates"],
+            ):
+                if mode == "messages":
+                    msg, metadata = chunk
+                    if metadata.get("langgraph_node") == "model" and msg.text:
+                        yield {"type": "token", "text": msg.text}
+                    continue
+
+                # "updates": new messages from each step, used to build the final state
+                for update in chunk.values():
+                    new_messages = (update or {}).get("messages") if isinstance(update, dict) else None
+                    for m in new_messages or []:
+                        messages.append(m)
+                        for call in getattr(m, "tool_calls", None) or []:
+                            yield {
+                                "type": "status",
+                                "tool": call["name"],
+                                "message": TOOL_STATUS_MESSAGES.get(call["name"], "Working on it…"),
+                            }
+            yield {"type": "done", "result": self._result_from_messages(messages)}
+        except Exception as e:
+            logger.exception(f"Error in stream_response: {e}")
+            yield {"type": "done", "result": ChatResult(_friendly_error(e))}
 
     @staticmethod
     def _extract_structured_result(messages: List[BaseMessage]) -> Tuple[str, Optional[Any]]:
@@ -218,27 +213,50 @@ class Chat:
                 response_type, data = mapped_type, m.artifact
         return response_type, data
 
-    def get_conversation_context(self, messages: List[Dict[str, str]], max_messages: int = 10) -> List[Dict[str, str]]:
-        """Get recent conversation context for API calls"""
-        return messages[-max_messages:] if len(messages) > max_messages else messages
-    
+    # ==================== Side tasks (small model) ====================
+
+    def _complete(self, instructions: str, prompt: str, max_output_tokens: int) -> str:
+        """One-shot text completion on the fallback (small, fast) model."""
+        response = self.client.responses.create(
+            model=self.settings.fallback_model,
+            instructions=instructions,
+            input=prompt,
+            max_output_tokens=max_output_tokens,
+            store=False,
+        )
+        return response.output_text.strip()
+
     def generate_title(self, message) -> str:
         """Generate a title for the chat session based on initial user message"""
         try:
-            prompt = f"Generate a concise and descriptive title (max 5 words) for a chat that starts with: {message}"
-            
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You generate short, concise titles for chat conversations. Respond with only the title, no quotes or extra text."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=10,
-                temperature=0.5
-            )
-            
-            title = response.choices[0].message.content.strip().strip('"')
-            return title if title else "New Chat"
-            
+            title = self._complete(
+                "You generate short, concise titles for chat conversations. "
+                "Respond with only the title, no quotes or extra text.",
+                f"Generate a concise and descriptive title (max 5 words) for a chat that starts with: {message}",
+                max_output_tokens=200,
+            ).strip('"')
+            return title or "New Chat"
         except Exception as e:
+            logger.warning(f"Title generation failed: {e}")
             return "New Chat"
+
+    def summarize_conversation(
+        self, previous_summary: Optional[str], messages: List[Dict[str, Any]]
+    ) -> Optional[str]:
+        """Fold messages into the running conversation summary. None on failure."""
+        lines = []
+        for msg in messages:
+            content = msg.get("content") or ""
+            if msg.get("data") is not None:
+                data = summarize_tool_data(msg.get("response_type"), msg["data"])
+                content += f" [{msg.get('response_type')} shown: {json.dumps(data)[:1500]}]"
+            lines.append(f"{msg.get('role')}: {content}")
+        prompt = (
+            f"Existing summary:\n{previous_summary or '(none)'}\n\n"
+            "New messages:\n" + "\n".join(lines)
+        )
+        try:
+            return self._complete(SUMMARY_INSTRUCTIONS, prompt, max_output_tokens=800) or None
+        except Exception as e:
+            logger.warning(f"Conversation summary failed: {e}")
+            return None

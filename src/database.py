@@ -38,6 +38,11 @@ class ChatSession(Base):
     user_id = Column(String, index=True)  # user_id from main backend JWT
     created_at = Column(DateTime, default=datetime.utcnow)
     title = Column(String, default="New Chat")
+    # Running summary of older messages, so long chats keep early context
+    # without sending every message to the model. summary_upto_id is the id of
+    # the last chat_messages row folded into the summary.
+    summary = Column(Text, nullable=True)
+    summary_upto_id = Column(Integer, nullable=True)
 
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
@@ -65,31 +70,37 @@ class ErrorLog(Base):
 
 def _migrate_chat_messages():
     """
-    Add chat_messages columns introduced after the table was first created.
+    Add columns introduced after the chat tables were first created.
 
     create_all() only creates missing tables; it never alters existing ones, so
     databases created before these columns existed need them added here.
     Additive and idempotent.
     """
     inspector = inspect(engine)
-    if not inspector.has_table("chat_messages"):
-        return
-
-    existing = {col["name"] for col in inspector.get_columns("chat_messages")}
     statements = []
-    if "response_type" not in existing:
-        statements.append(
-            "ALTER TABLE chat_messages "
-            "ADD COLUMN response_type VARCHAR NOT NULL DEFAULT 'message'"
-        )
-    if "data" not in existing:
-        statements.append("ALTER TABLE chat_messages ADD COLUMN data JSON")
+
+    if inspector.has_table("chat_messages"):
+        existing = {col["name"] for col in inspector.get_columns("chat_messages")}
+        if "response_type" not in existing:
+            statements.append(
+                "ALTER TABLE chat_messages "
+                "ADD COLUMN response_type VARCHAR NOT NULL DEFAULT 'message'"
+            )
+        if "data" not in existing:
+            statements.append("ALTER TABLE chat_messages ADD COLUMN data JSON")
+
+    if inspector.has_table("chat_sessions"):
+        existing = {col["name"] for col in inspector.get_columns("chat_sessions")}
+        if "summary" not in existing:
+            statements.append("ALTER TABLE chat_sessions ADD COLUMN summary TEXT")
+        if "summary_upto_id" not in existing:
+            statements.append("ALTER TABLE chat_sessions ADD COLUMN summary_upto_id INTEGER")
 
     if statements:
         with engine.begin() as conn:
             for statement in statements:
                 conn.execute(text(statement))
-        logger.info(f"Migrated chat_messages: {statements}")
+        logger.info(f"Migrated chat tables: {statements}")
 
 
 def init_db():
