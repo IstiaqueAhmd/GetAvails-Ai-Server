@@ -11,9 +11,10 @@ response_format="content_and_artifact" and return a (content, artifact) pair:
 Register each such tool's response type in TOOL_RESPONSE_TYPES at the bottom.
 
 search_artists and search_venues call the GetAvails backend. web_search calls
-Tavily for external information and returns text only (no artifact). generate_offer
-still returns dummy data; replace its body with a real call and keep the
-(content, artifact) return shape.
+Tavily for external information and returns text only (no artifact).
+generate_offer calls nothing: it validates the offer details the model
+collected against OfferDraft (src/schema.py) and returns them for the client to
+open in its offer form, where the user adds the recipient and signature.
 """
 
 import json
@@ -22,12 +23,14 @@ import os
 import re
 import threading
 import time
-import uuid
-from datetime import date, datetime
+from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from langchain_core.tools import BaseTool, tool
+from pydantic import ValidationError
+
+from src.schema import OfferDraft
 
 # Configure logger for tools
 logger = logging.getLogger("tour_guide.tools")
@@ -151,6 +154,9 @@ def _summarize_venue(row: Dict[str, Any]) -> Dict[str, Any]:
             "address": row.get("address"),
             "city": row.get("city"),
             "state": row.get("state"),
+            # With the above, enough to fill in the venue lines of an offer
+            "postal_code": row.get("postal_code"),
+            "country": row.get("country"),
             "capacity": capacity,
             "popularity_score": row.get("score"),
         }
@@ -174,6 +180,9 @@ def summarize_tool_data(response_type: Optional[str], data: Any) -> Any:
         return [_summarize_artist(row) for row in data if isinstance(row, dict)]
     if response_type == "venues" and isinstance(data, list):
         return [_summarize_venue(row) for row in data if isinstance(row, dict)]
+    if response_type == "offer" and isinstance(data, dict):
+        # Optional fields left unset are noise for the model
+        return {key: value for key, value in data.items() if value not in (None, "", [])}
     return data
 
 
@@ -371,45 +380,76 @@ def search_venues(
     return content, venues
 
 
-@tool(response_format="content_and_artifact")
-def generate_offer(
-    artist_id: str,
-    venue_id: str,
-    event_date: str,
-    fee: float,
-    currency: str = "USD",
-    notes: Optional[str] = None,
-) -> Tuple[str, Dict[str, Any]]:
+def _offer_validation_message(error: ValidationError) -> str:
     """
-    Draft a booking offer between an artist and a venue. This only creates a
-    draft for the user to review; it does not send anything.
-
-    Only use this once you know the artist, the venue, the event date, and the
-    fee. If any of these are missing, ask the user instead of guessing. Use the
-    `id` values returned by search_artists and search_venues.
-
-    Args:
-        artist_id: ID of the artist the offer is for (the `id` from search_artists)
-        venue_id: ID of the venue hosting the event (the `id` from search_venues)
-        event_date: Event date in YYYY-MM-DD format
-        fee: Offered performance fee
-        currency: Currency code for the fee (default: "USD")
-        notes: Optional extra terms or details for the offer
+    Tool result for generate_offer arguments that fail OfferDraft validation:
+    tells the model which details to ask the user for and which to correct.
     """
-    logger.info(f"generate_offer called: artist={artist_id}, venue={venue_id}, date={event_date}, fee={fee}")
+    missing: List[str] = []
+    invalid: List[str] = []
+    for err in error.errors():
+        field = str(err["loc"][0]) if err["loc"] else "offer"
+        if err["type"] == "missing":
+            missing.append(field)
+        elif err["type"] == "extra_forbidden":
+            invalid.append(f"{field}: not an offer field, leave it out")
+        else:
+            invalid.append(f"{field}: {err['msg'].removeprefix('Value error, ')}")
 
-    offer = {
-        "offer_id": f"offer_{uuid.uuid4().hex[:8]}",
-        "status": "draft",
-        "artist_id": artist_id,
-        "venue_id": venue_id,
-        "event_date": event_date,
-        "fee": fee,
-        "currency": currency.upper(),
-        "notes": notes,
-        "created_at": datetime.utcnow().isoformat() + "Z",
-    }
-    return json.dumps(offer), offer
+    # Field names only: the values are users' contact details
+    logger.info(f"generate_offer rejected: missing={missing}, invalid={[i.split(':')[0] for i in invalid]}")
+
+    lines = ["The offer was not drafted."]
+    if missing:
+        lines.append(
+            f"Missing required fields: {', '.join(missing)}. "
+            "Ask the user for these; do not guess or fill in placeholders."
+        )
+    if invalid:
+        lines.append("Invalid values:")
+        lines += [f"- {problem}" for problem in invalid]
+    lines.append("Call generate_offer again with every field once this is resolved.")
+    return "\n".join(lines)
+
+
+@tool(args_schema=OfferDraft, response_format="content_and_artifact")
+def generate_offer(**fields: Any) -> Tuple[str, Dict[str, Any]]:
+    """
+    Draft a booking offer for the user to review. The app opens the draft in
+    its offer form, where the user adds the recipient and their signature and
+    sends it. This tool sends nothing and takes no recipient or signature.
+
+    The offer form fills in the signatory's and buyer's details from the
+    user's profile. Do not ask for them; pass them only if the user states
+    them.
+
+    Use it when the user wants to create, draft, or send an offer. Every value
+    must come from the user or from search results in this conversation: never
+    guess or invent names, addresses, phone numbers, amounts, or times. If
+    required details are missing, ask the user for them, a few related ones at
+    a time, and call this tool once you have them all. Leave out optional
+    fields the user has not mentioned.
+
+    Each call produces a complete draft. To change an earlier draft, call this
+    tool again with all of its fields plus the changes.
+    """
+    # Arguments arrive already validated against OfferDraft (the args_schema).
+    # Dumping in JSON mode gives dates, times and amounts as strings, in the
+    # same form the backend's offer API uses.
+    offer = OfferDraft(**fields).model_dump(mode="json")
+    logger.info(
+        f"generate_offer drafted: artist={offer['artist_name']}, venue={offer['venue']}, date={offer['date']}"
+    )
+    content = (
+        "Offer drafted and shown to the user for review. It has not been sent: "
+        "the user adds the recipient and their signature in the offer form, then sends it."
+    )
+    return content, offer
+
+
+# Invalid or incomplete arguments come back to the model as instructions
+# instead of pydantic's raw error text
+generate_offer.handle_validation_error = _offer_validation_message
 
 
 @tool
